@@ -4,6 +4,7 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
@@ -19,6 +20,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.provider.MediaStore
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
@@ -60,6 +62,7 @@ class TranslateService : Service() {
     private var modelReady = false
     private var nullCount = 0
     private var paused = false
+    private var saveNext = false
     private var editing = false
     private val editViews = mutableListOf<View>()
     private var editBtn: TextView? = null
@@ -147,16 +150,20 @@ class TranslateService : Service() {
                 width + rowPadding / plane.pixelStride, height, Bitmap.Config.ARGB_8888
             )
             full.copyPixelsFromBuffer(plane.buffer)
+            val doSave = saveNext
+            saveNext = false
+            if (doSave) saveBitmap(full, "tam_ekran")
             crop = Bitmap.createBitmap(full, subX, subY, subW, subH)
+            if (doSave) {
+                saveBitmap(crop, "altyazi_alani")
+                showText("Kareler kaydedildi: Galeri > OyunCevir klasörü")
+            }
             full.recycle()
         } finally {
             image.close()
         }
 
-        if (isBlack(crop)) {
-            if (debug) showText("Yakalanan görüntü SİYAH: Remote Play ekran yakalamayı engelliyor olabilir")
-            return
-        }
+        val black = isBlack(crop)
 
         busy = true
         recognizer.process(InputImage.fromBitmap(crop, 0))
@@ -166,7 +173,14 @@ class TranslateService : Service() {
                     emptyCount++
                     if (emptyCount >= 3) {
                         lastWords = emptySet()
-                        if (debug) showText("Altyazı okunamadı (OCR boş)") else overlay?.visibility = View.GONE
+                        if (debug) {
+                            showText(
+                                if (black) "Yakalanan görüntü SİYAH: Remote Play ekran yakalamayı engelliyor olabilir"
+                                else "Altyazı okunamadı (OCR boş)"
+                            )
+                        } else {
+                            overlay?.visibility = View.GONE
+                        }
                     }
                     busy = false
                 } else {
@@ -277,20 +291,34 @@ class TranslateService : Service() {
         )
     }
 
+    // Gerçekten siyah (0,0,0) mı? Karanlık sahneleri yanlışlıkla siyah sayma
     private fun isBlack(b: Bitmap): Boolean {
-        val stepX = maxOf(1, b.width / 24)
-        val stepY = maxOf(1, b.height / 8)
         var y = 0
         while (y < b.height) {
             var x = 0
             while (x < b.width) {
                 val p = b.getPixel(x, y)
-                if (Color.red(p) + Color.green(p) + Color.blue(p) > 30) return false
-                x += stepX
+                if (Color.red(p) + Color.green(p) + Color.blue(p) > 6) return false
+                x += 6
             }
-            y += stepY
+            y += 6
         }
         return true
+    }
+
+    private fun saveBitmap(b: Bitmap, name: String) {
+        try {
+            val values = ContentValues().apply {
+                put(MediaStore.Images.Media.DISPLAY_NAME, name + "_" + System.currentTimeMillis() + ".png")
+                put(MediaStore.Images.Media.MIME_TYPE, "image/png")
+                if (Build.VERSION.SDK_INT >= 29) {
+                    put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/OyunCevir")
+                }
+            }
+            val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return
+            contentResolver.openOutputStream(uri)?.use { b.compress(Bitmap.CompressFormat.PNG, 100, it) }
+        } catch (e: Exception) {
+        }
     }
 
     private fun addControlPanel() {
@@ -308,11 +336,16 @@ class TranslateService : Service() {
         pauseBtn = pause
         val edit = btn("✎ DÜZENLE", 0xCC2E7D32.toInt()) { toggleEdit() }
         editBtn = edit
+        val shot = btn("📷", 0xCC6A1B9A.toInt()) {
+            saveNext = true
+            if (debug) showText("Bir sonraki kare kaydedilecek…")
+        }
         val stop = btn("✕ KAPAT", 0xCCB00020.toInt()) { stopSelf() }
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             addView(pause)
             addView(edit)
+            addView(shot)
             addView(stop)
         }
         panelRow = row
