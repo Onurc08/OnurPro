@@ -23,6 +23,7 @@ import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
+import android.widget.LinearLayout
 import android.widget.TextView
 import com.google.mlkit.common.model.DownloadConditions
 import com.google.mlkit.nl.translate.TranslateLanguage
@@ -57,6 +58,15 @@ class TranslateService : Service() {
 
     private val executor = Executors.newSingleThreadExecutor()
     private var modelReady = false
+    private var nullCount = 0
+    private var paused = false
+    private var editing = false
+    private val editViews = mutableListOf<View>()
+    private var editBtn: TextView? = null
+    private var panelRow: View? = null
+    private val coverViews = mutableListOf<View>()
+    private var pauseBtn: TextView? = null
+    private var debug = true
     private var busy = false
     private var lastWords: Set<String> = emptySet()
     private var emptyCount = 0
@@ -96,29 +106,14 @@ class TranslateService : Service() {
 
         wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
 
-        // Altyazı okuma alanı (piksel)
-        val sub = Cfg.load(this, "sub", Cfg.SUB_DEF)
-        subX = (sub.l * width).toInt().coerceIn(0, width - 20)
-        subY = (sub.t * height).toInt().coerceIn(0, height - 20)
-        subW = (sub.w * width).toInt().coerceIn(20, width - subX)
-        subH = (sub.h * height).toInt().coerceIn(20, height - subY)
-
         val prefs = getSharedPreferences("p", Context.MODE_PRIVATE)
+        debug = prefs.getBoolean("debug", true)
 
-        // Oyunu gizleyen siyah şeritler: altyazı alanı açık kalır, çünkü okunması gerekiyor
-        if (prefs.getBoolean("cover", true)) {
-            fun bar(x: Int, y: Int, bw: Int, bh: Int) {
-                if (bw > 0 && bh > 0) {
-                    addWin(View(this).apply { setBackgroundColor(Color.BLACK) }, x, y, bw, bh)
-                }
-            }
-            bar(0, 0, width, subY)
-            bar(0, subY + subH, width, height - subY - subH)
-            bar(0, subY, subX, subH)
-            bar(subX + subW, subY, width - subX - subW, subH)
-        }
+        loadSub()
+        buildCover()
 
         createOverlay(prefs.getInt("size", 50))
+        addControlPanel()
         // Çevrimdışı yedek model arka planda iner; asıl çeviri Google ile yapılır
         translator.downloadModelIfNeeded(DownloadConditions.Builder().build())
             .addOnSuccessListener { modelReady = true }
@@ -131,13 +126,19 @@ class TranslateService : Service() {
 
     private val loop = object : Runnable {
         override fun run() {
-            if (!busy) captureAndTranslate()
+            if (!busy && !paused) captureAndTranslate()
             handler.postDelayed(this, 500)
         }
     }
 
     private fun captureAndTranslate() {
-        val image = reader?.acquireLatestImage() ?: return
+        val image = reader?.acquireLatestImage()
+        if (image == null) {
+            nullCount++
+            if (debug && nullCount == 8) showText("Görüntü akışı gelmiyor")
+            return
+        }
+        nullCount = 0
         val crop: Bitmap
         try {
             val plane = image.planes[0]
@@ -152,13 +153,21 @@ class TranslateService : Service() {
             image.close()
         }
 
+        if (isBlack(crop)) {
+            if (debug) showText("Yakalanan görüntü SİYAH: Remote Play ekran yakalamayı engelliyor olabilir")
+            return
+        }
+
         busy = true
         recognizer.process(InputImage.fromBitmap(crop, 0))
             .addOnSuccessListener { result ->
                 val text = result.text.replace("\n", " ").trim()
                 if (text.length < 3) {
                     emptyCount++
-                    if (emptyCount >= 3) { overlay?.visibility = View.GONE; lastWords = emptySet() }
+                    if (emptyCount >= 3) {
+                        lastWords = emptySet()
+                        if (debug) showText("Altyazı okunamadı (OCR boş)") else overlay?.visibility = View.GONE
+                    }
                     busy = false
                 } else {
                     emptyCount = 0
@@ -167,8 +176,14 @@ class TranslateService : Service() {
                         busy = false
                     } else {
                         lastWords = words
+                        if (debug) showText("OCR: " + text.take(120))
                         translateText(text.take(500)) { out ->
-                            if (out != null) showText(out) else lastWords = emptySet()
+                            if (out != null) {
+                                showText(out)
+                            } else {
+                                lastWords = emptySet()
+                                if (debug) showText("Çeviri başarısız (internet?): " + text.take(80))
+                            }
                             busy = false
                         }
                     }
@@ -262,7 +277,175 @@ class TranslateService : Service() {
         )
     }
 
+    private fun isBlack(b: Bitmap): Boolean {
+        val stepX = maxOf(1, b.width / 24)
+        val stepY = maxOf(1, b.height / 8)
+        var y = 0
+        while (y < b.height) {
+            var x = 0
+            while (x < b.width) {
+                val p = b.getPixel(x, y)
+                if (Color.red(p) + Color.green(p) + Color.blue(p) > 30) return false
+                x += stepX
+            }
+            y += stepY
+        }
+        return true
+    }
+
+    private fun addControlPanel() {
+        fun btn(label: String, color: Int, onClick: () -> Unit): TextView {
+            return TextView(this).apply {
+                text = label
+                setTextColor(Color.WHITE)
+                setBackgroundColor(color)
+                textSize = 14f
+                setPadding(28, 18, 28, 18)
+                setOnClickListener { onClick() }
+            }
+        }
+        val pause = btn("⏸ DURAKLAT", 0xCC1565C0.toInt()) { togglePause() }
+        pauseBtn = pause
+        val edit = btn("✎ DÜZENLE", 0xCC2E7D32.toInt()) { toggleEdit() }
+        editBtn = edit
+        val stop = btn("✕ KAPAT", 0xCCB00020.toInt()) { stopSelf() }
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(pause)
+            addView(edit)
+            addView(stop)
+        }
+        panelRow = row
+        val lp = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply { gravity = Gravity.TOP or Gravity.END }
+        wm.addView(row, lp)
+        added.add(row)
+    }
+
+    private fun loadSub() {
+        val sub = Cfg.load(this, "sub", Cfg.SUB_DEF)
+        subX = (sub.l * width).toInt().coerceIn(0, width - 20)
+        subY = (sub.t * height).toInt().coerceIn(0, height - 20)
+        subW = (sub.w * width).toInt().coerceIn(20, width - subX)
+        subH = (sub.h * height).toInt().coerceIn(20, height - subY)
+    }
+
+    // Oyunu gizleyen siyah şeritler: altyazı alanı açık kalır, çünkü okunması gerekiyor
+    private fun buildCover() {
+        coverViews.forEach {
+            try { wm.removeView(it) } catch (_: Exception) {}
+            added.remove(it)
+        }
+        coverViews.clear()
+        val prefs = getSharedPreferences("p", Context.MODE_PRIVATE)
+        if (prefs.getBoolean("cover", true)) {
+            fun bar(x: Int, y: Int, bw: Int, bh: Int) {
+                if (bw > 0 && bh > 0) {
+                    val v = View(this).apply { setBackgroundColor(Color.BLACK) }
+                    addWin(v, x, y, bw, bh)
+                    coverViews.add(v)
+                }
+            }
+            bar(0, 0, width, subY)
+            bar(0, subY + subH, width, height - subY - subH)
+            bar(0, subY, subX, subH)
+            bar(subX + subW, subY, width - subX - subW, subH)
+        }
+        // Yeni şeritler üstte kalmasın: çeviri kutusu ve panel yeniden en üste alınır
+        front(overlay)
+        front(panelRow)
+    }
+
+    private fun front(v: View?) {
+        if (v == null) return
+        val lp = v.layoutParams ?: return
+        try { wm.removeView(v) } catch (_: Exception) {}
+        wm.addView(v, lp)
+    }
+
+    private fun placeOverlay() {
+        val tr = Cfg.load(this, "tr", Cfg.TR_DEF)
+        val v = overlay ?: return
+        val lp = v.layoutParams as? WindowManager.LayoutParams ?: return
+        lp.x = (tr.l * width).toInt()
+        lp.y = (tr.t * height).toInt()
+        lp.width = (tr.w * width).toInt().coerceAtLeast(200)
+        lp.height = (tr.h * height).toInt().coerceAtLeast(100)
+        wm.updateViewLayout(v, lp)
+    }
+
+    private fun addEditBox(key: String, label: String, color: Int, def: Area) {
+        val a = Cfg.load(this, key, def)
+        val lp = WindowManager.LayoutParams(
+            (a.w * width).toInt(),
+            (a.h * height).toInt(),
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = (a.l * width).toInt()
+            y = (a.t * height).toInt()
+        }
+        val v = BoxView(this, label, color, wm, lp) {
+            Cfg.save(
+                this, key,
+                Area(lp.x.toFloat() / width, lp.y.toFloat() / height, lp.width.toFloat() / width, lp.height.toFloat() / height)
+            )
+        }
+        wm.addView(v, lp)
+        editViews.add(v)
+    }
+
+    private fun toggleEdit() {
+        if (!editing) {
+            editing = true
+            paused = true
+            coverViews.forEach { it.visibility = View.GONE }
+            overlay?.visibility = View.GONE
+            editBtn?.text = "✔ KAYDET"
+            addEditBox("sub", "ALTYAZI ALANI\n(buradaki yazı okunacak)\n(sağ alt köşeden büyüt)", Color.RED, Cfg.SUB_DEF)
+            addEditBox("tr", "ÇEVİRİ KUTUSU\n(çeviri burada görünecek)\n(sağ alt köşeden büyüt)", Color.BLUE, Cfg.TR_DEF)
+            front(panelRow)
+        } else {
+            editViews.forEach { try { wm.removeView(it) } catch (_: Exception) {} }
+            editViews.clear()
+            editing = false
+            loadSub()
+            buildCover()
+            placeOverlay()
+            paused = false
+            lastWords = emptySet()
+            emptyCount = 0
+            editBtn?.text = "✎ DÜZENLE"
+        }
+    }
+
+    private fun togglePause() {
+        if (editing) return
+        paused = !paused
+        if (paused) {
+            coverViews.forEach { it.visibility = View.GONE }
+            overlay?.visibility = View.GONE
+            pauseBtn?.text = "▶ DEVAM"
+        } else {
+            coverViews.forEach { it.visibility = View.VISIBLE }
+            lastWords = emptySet()
+            emptyCount = 0
+            pauseBtn?.text = "⏸ DURAKLAT"
+        }
+    }
+
     private fun showText(t: String) {
+        if (paused) return
         overlay?.text = t
         overlay?.visibility = View.VISIBLE
     }
@@ -291,6 +474,7 @@ class TranslateService : Service() {
         reader?.close()
         projection?.stop()
         if (::wm.isInitialized) {
+            editViews.forEach { try { wm.removeView(it) } catch (_: Exception) {} }
             added.forEach { try { wm.removeView(it) } catch (_: Exception) {} }
         }
         added.clear()

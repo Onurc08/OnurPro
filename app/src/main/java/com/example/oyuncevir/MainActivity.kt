@@ -47,6 +47,12 @@ class MainActivity : Activity() {
             setOnCheckedChangeListener { _, c -> prefs.edit().putBoolean("cover", c).apply() }
         })
 
+        root.addView(CheckBox(this).apply {
+            text = "Hata ayıklama mesajlarını göster (sorun varken açık kalsın)"
+            isChecked = prefs.getBoolean("debug", true)
+            setOnCheckedChangeListener { _, c -> prefs.edit().putBoolean("debug", c).apply() }
+        })
+
         val tv = TextView(this).apply { text = "Çeviri yazı boyutu (üst sınır): ${prefs.getInt("size", 50)}%" }
         val sb = SeekBar(this).apply { max = 100; progress = prefs.getInt("size", 50) }
         sb.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
